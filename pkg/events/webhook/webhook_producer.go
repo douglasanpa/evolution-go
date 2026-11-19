@@ -44,7 +44,7 @@ func NewWebhookProducer(
 		url:           url,
 		loggerWrapper: loggerWrapper,
 		client:        &http.Client{Timeout: webhookTimeout()},
-		retryDelays:   mustParseDelays(defaultWebhookRetryDelays),
+		retryDelays:   webhookRetryDelays(loggerWrapper),
 	}
 }
 
@@ -61,18 +61,62 @@ func webhookTimeout() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func mustParseDelays(raw string) []time.Duration {
+// webhookRetryDelays reads WEBHOOK_RETRY_DELAYS (a comma-separated list of
+// time.Duration values, e.g. "5s,15s,1m"). The number of attempts is
+// len(delays)+1. An invalid value falls back to the default and is reported in
+// the log.
+func webhookRetryDelays(loggerWrapper *logger_wrapper.LoggerManager) []time.Duration {
+	raw := strings.TrimSpace(os.Getenv("WEBHOOK_RETRY_DELAYS"))
+	if raw == "" {
+		return mustParseDelays(defaultWebhookRetryDelays)
+	}
+	delays, err := parseRetryDelays(raw)
+	if err != nil {
+		logForManager(loggerWrapper, "webhook", func(logger *logger_wrapper.Logger) {
+			logger.LogWarn("[webhook] invalid WEBHOOK_RETRY_DELAYS %q (%v), using default %q", raw, err, defaultWebhookRetryDelays)
+		})
+		return mustParseDelays(defaultWebhookRetryDelays)
+	}
+	return delays
+}
+
+func parseRetryDelays(raw string) ([]time.Duration, error) {
 	parts := strings.Split(raw, ",")
 	delays := make([]time.Duration, 0, len(parts))
 	for _, part := range parts {
-		d, err := time.ParseDuration(strings.TrimSpace(part))
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("empty delay in %q", raw)
+		}
+		d, err := time.ParseDuration(part)
 		if err != nil {
-			// Only reachable if the constant itself is wrong.
-			return []time.Duration{5 * time.Second}
+			return nil, err
+		}
+		if d < 0 {
+			return nil, fmt.Errorf("negative delay %q", part)
 		}
 		delays = append(delays, d)
 	}
 	if len(delays) == 0 {
+		return nil, fmt.Errorf("no delays in %q", raw)
+	}
+	return delays, nil
+}
+
+// logForManager runs fn with the named logger when a manager is available.
+func logForManager(loggerWrapper *logger_wrapper.LoggerManager, name string, fn func(*logger_wrapper.Logger)) {
+	if loggerWrapper == nil {
+		return
+	}
+	if logger := loggerWrapper.GetLogger(name); logger != nil {
+		fn(logger)
+	}
+}
+
+func mustParseDelays(raw string) []time.Duration {
+	delays, err := parseRetryDelays(raw)
+	if err != nil {
+		// Only reachable if the constant itself is wrong.
 		return []time.Duration{5 * time.Second}
 	}
 	return delays

@@ -14,9 +14,7 @@ import (
 func newTestProducer(t *testing.T, url string) *webhookProducer {
 	t.Helper()
 	producer := NewWebhookProducer(url, nil).(*webhookProducer)
-	// Short waits so the retry loop runs fast; the number of attempts is
-	// preserved when the test needs it.
-	producer.retryDelays = []time.Duration{time.Millisecond}
+	producer.retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
 	return producer
 }
 
@@ -70,7 +68,7 @@ func TestSendWebhookWithRetryRetries429(t *testing.T) {
 	producer.sendWebhookWithRetry(server.URL, []byte(`{}`), "instance")
 
 	if got := atomic.LoadInt32(&attempts); got != 3 {
-		t.Fatalf("429 must be retried: expected 3 attempts, got %d", got)
+		t.Fatalf("429 must be retried: expected 3 attempts (2 waits of 1ms), got %d", got)
 	}
 }
 
@@ -119,6 +117,41 @@ func TestDefaultDelaysPreserveUpstreamBehavior(t *testing.T) {
 		if d != 30*time.Second {
 			t.Fatalf("wait %d: expected 30s, got %v", i, d)
 		}
+	}
+}
+
+func TestRetryDelaysComeFromEnvironment(t *testing.T) {
+	t.Setenv("WEBHOOK_RETRY_DELAYS", "1ms,1ms")
+	producer := newTestProducer(t, "http://example.invalid")
+
+	want := []time.Duration{time.Millisecond, time.Millisecond}
+	if len(producer.retryDelays) != len(want) {
+		t.Fatalf("expected %d delays, got %v", len(want), producer.retryDelays)
+	}
+	for i := range want {
+		if producer.retryDelays[i] != want[i] {
+			t.Fatalf("delay %d: expected %v, got %v", i, want[i], producer.retryDelays[i])
+		}
+	}
+
+	// Number of attempts = len(delays) + 1.
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	producer.sendWebhookWithRetry(server.URL, []byte(`{}`), "instance")
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("expected len(delays)+1 = 3 attempts, got %d", got)
+	}
+}
+
+func TestRetryDelaysInvalidValueFallsBackToDefault(t *testing.T) {
+	t.Setenv("WEBHOOK_RETRY_DELAYS", "5s,banana")
+	producer := NewWebhookProducer("http://example.invalid", nil).(*webhookProducer)
+	if len(producer.retryDelays) != 4 || producer.retryDelays[0] != 30*time.Second {
+		t.Fatalf("invalid value must fall back to the 4x30s default, got %v", producer.retryDelays)
 	}
 }
 
